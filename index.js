@@ -1,89 +1,101 @@
 require('dotenv').config()
 const TelegramBot = require('node-telegram-bot-api')
-const { GoogleGenerativeAI } = require('@google/generative-ai')
-const { createClient } = require('@supabase/supabase-js')
+const Groq = require('groq-sdk')
+const { Pool } = require('pg')
 
-// === SETUP ===
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true })
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' })
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+})
 
 console.log('🤖 Bot tugas aktif!')
 
-// === FUNGSI AMBIL SEMUA TUGAS ===
-async function ambilTugas() {
-  const { data, error } = await supabase
-    .from('tugas')
-    .select('*')
-    .eq('selesai', false)
-    .order('deadline', { ascending: true })
-
-  if (error) throw error
-  return data || []
+async function ambilTugas(userId) {
+  const result = await pool.query(
+    'SELECT * FROM tugas WHERE selesai = FALSE AND user_id = $1 ORDER BY deadline ASC',
+    [userId]
+  )
+  return result.rows
 }
 
-// === FUNGSI PROSES PESAN DENGAN AI ===
-async function prosesPerintah(pesan) {
-  const tugasList = await ambilTugas()
+async function prosesPerintah(pesan, userId) {
+  const tugasList = await ambilTugas(userId)
   const hariIni = new Date().toISOString().split('T')[0]
 
   const prompt = `Kamu adalah asisten pencatat tugas kuliah bernama TugasBot. Hari ini: ${hariIni}.
-    
 Data tugas yang belum selesai: ${JSON.stringify(tugasList)}
 
-Tugasmu adalah memahami pesan user dan menentukan aksi yang harus dilakukan.
-Balas HANYA dalam format JSON seperti ini (tanpa teks lain, tanpa markdown, tanpa backtick):
+Balas HANYA dalam format JSON (tanpa teks lain, tanpa markdown, tanpa backtick):
 {
-  "aksi": "simpan_tugas" | "list_tugas" | "deadline_dekat" | "selesai_tugas" | "hapus_tugas" | "info",
-  "data": {
-    "mata_kuliah": "...",
-    "deskripsi": "...",
-    "deadline": "YYYY-MM-DD"
-  },
+  "aksi": "simpan_tugas|list_tugas|deadline_dekat|selesai_tugas|hapus_tugas|info",
+  "tugas_list": [
+    {
+      "mata_kuliah": "...",
+      "deskripsi": "...",
+      "deadline": "YYYY-MM-DD"
+    }
+  ],
   "id": 123,
-  "balasan": "pesan balasan ke user dalam bahasa Indonesia yang ramah dan pakai emoji"
+  "balasan": "pesan balasan ramah pakai emoji"
 }
 
-Aturan:
-- "simpan_tugas": kalau user menyebut tugas baru dengan deadline
-- "list_tugas": kalau user minta lihat semua tugas
-- "deadline_dekat": kalau user tanya tugas yang mendekati deadline (dalam 7 hari)
-- "selesai_tugas": kalau user bilang tugas sudah selesai/dikerjakan (isi id tugas yang dimaksud)
-- "hapus_tugas": kalau user minta hapus tugas (isi id tugas yang dimaksud)
-- "info": kalau pesan tidak berhubungan dengan tugas
+Aturan aksi:
+- simpan_tugas: ada tugas baru dengan deadline, tugas_list bisa berisi LEBIH DARI SATU tugas sekaligus
+- list_tugas: minta lihat semua tugas
+- deadline_dekat: tanya tugas mendekati deadline 7 hari
+- selesai_tugas: tugas sudah selesai, isi id
+- hapus_tugas: minta hapus tugas, isi id
+- info: tidak berhubungan dengan tugas
 
-Untuk balasan list_tugas dan deadline_dekat, tampilkan tugas dengan format yang rapi pakai emoji.
-Jika tidak ada tugas, beritahu dengan ramah.
+Format balasan untuk list_tugas dan deadline_dekat harus rapi seperti ini:
+📚 Tugas kamu saat ini:
+
+1. [mata_kuliah]
+   📝 [deskripsi]
+   ⏰ Deadline: [tanggal dalam format DD MMMM YYYY]
+   🆔 ID: [id]
+
+Untuk simpan_tugas, konfirmasi tugas yang berhasil disimpan dengan format:
+✅ Berhasil menyimpan [jumlah] tugas:
+1. [mata_kuliah] - [deskripsi] (deadline: DD MMMM YYYY)
+2. dst...
 
 Pesan user: ${pesan}`
 
-  const result = await model.generateContent(prompt)
-  let teks = result.response.text().trim()
+  const result = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.3
+  })
+  let teks = result.choices[0].message.content.trim()
   teks = teks.replace(/```json|```/g, '').trim()
   return JSON.parse(teks)
 }
 
-// === HANDLE PESAN MASUK ===
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id
+  const userId = msg.from.id
   const teks = msg.text
-
   if (!teks) return
 
   if (teks === '/start') {
-    bot.sendMessage(chatId, `👋 Halo! Saya *TugasBot*, asisten pencatat tugas kuliah kamu!
+    bot.sendMessage(chatId, `👋 Halo *${msg.from.first_name}*! Saya *TugasBot*, asisten pencatat tugas kuliah kamu!
 
 Kamu bisa chat natural ke saya, contoh:
 
-📝 *Simpan tugas:*
+📝 *Simpan 1 tugas:*
 "Tugas Alpro bikin program sorting deadline 30 April"
 
+📝 *Simpan banyak tugas sekaligus:*
+"Tugas PAA dan PPL praktikum deadline 27 Mei"
+
 📋 *Lihat semua tugas:*
-"List semua tugas"
+"Apa saja tugasku sekarang?"
 
 ⏰ *Cek deadline dekat:*
-"Tugas apa yang deadline-nya dekat?"
+"Tugas mana yang paling urgent?"
 
 ✅ *Tandai selesai:*
 "Tugas Alpro sudah selesai"
@@ -96,33 +108,28 @@ Kamu bisa chat natural ke saya, contoh:
   bot.sendChatAction(chatId, 'typing')
 
   try {
-    const hasil = await prosesPerintah(teks)
+    const hasil = await prosesPerintah(teks, userId)
 
-    if (hasil.aksi === 'simpan_tugas' && hasil.data) {
-      const { error } = await supabase.from('tugas').insert([{
-        mata_kuliah: hasil.data.mata_kuliah,
-        deskripsi: hasil.data.deskripsi,
-        deadline: hasil.data.deadline
-      }])
-      if (error) throw error
-
+    if (hasil.aksi === 'simpan_tugas' && hasil.tugas_list && hasil.tugas_list.length > 0) {
+      for (const t of hasil.tugas_list) {
+        await pool.query(
+          'INSERT INTO tugas (user_id, mata_kuliah, deskripsi, deadline) VALUES ($1, $2, $3, $4)',
+          [userId, t.mata_kuliah, t.deskripsi, t.deadline]
+        )
+      }
     } else if (hasil.aksi === 'selesai_tugas' && hasil.id) {
-      const { error } = await supabase
-        .from('tugas')
-        .update({ selesai: true })
-        .eq('id', hasil.id)
-      if (error) throw error
-
+      await pool.query(
+        'UPDATE tugas SET selesai = TRUE WHERE id = $1 AND user_id = $2',
+        [hasil.id, userId]
+      )
     } else if (hasil.aksi === 'hapus_tugas' && hasil.id) {
-      const { error } = await supabase
-        .from('tugas')
-        .delete()
-        .eq('id', hasil.id)
-      if (error) throw error
+      await pool.query(
+        'DELETE FROM tugas WHERE id = $1 AND user_id = $2',
+        [hasil.id, userId]
+      )
     }
 
     bot.sendMessage(chatId, hasil.balasan)
-
   } catch (err) {
     console.error('Error:', err)
     bot.sendMessage(chatId, '⚠️ Maaf, ada error. Coba lagi ya!')
